@@ -1,0 +1,556 @@
+
+
+local pathService = game:GetService("PathfindingService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- base npc class
+local npc = {}
+npc.__index = npc
+
+-- creates new npc from config, clones template, sets up properties
+function npc.new(config)
+	local self = setmetatable({}, npc)
+	config = config or {}
+
+	-- find the template model in replicated storage to clone from
+	local template = ReplicatedStorage:FindFirstChild("Noob")
+	if not template then warn("NO NOOB") return nil end
+
+	self.model = template:Clone()
+	self.model.Name = config.name or "npc"
+
+	-- position npc at spawn point if provided
+	if config.spawnPosition and self.model:FindFirstChild("HumanoidRootPart") then
+		self.model.HumanoidRootPart.CFrame = CFrame.new(config.spawnPosition)
+	end
+
+	-- place model in workspace so it appears in game
+	self.model.Parent = workspace
+	self.hum = self.model:FindFirstChildOfClass("Humanoid")
+	self.hrp = self.model:FindFirstChild("HumanoidRootPart")
+
+	-- movement configuration from config or defaults
+	self.wanderDist = config.wanderRadius or 50
+	self.wanderWait = config.wanderInterval or 5
+	self.sightRange = config.detectionRange or 30
+	self.speed = config.walkSpeed or 16
+	self.usePath = config.usePathfinding or false
+
+	-- initialize state variables
+	self.currentState = "idle"
+	self.targ = nil
+	self.distToPlyr = math.huge -- start with infinite distance
+	self.lastWanderTime = 0
+	self.active = false
+	self.lastTargPos = nil
+
+	-- stuck detection tracking
+	self.lastPosition = self.hrp and self.hrp.Position or Vector3.new(0, 0, 0)
+	self.lastMoveCheckTime = os.clock()
+	self.stuckCheckInterval = 5 -- check every 5 seconds
+	self.minMovementDistance = 1 -- must move at least 1 stud to not be stuck
+
+	if self.hum then self.hum.WalkSpeed = self.speed end
+	return self
+end
+
+-- switches npc state, calls exit and enter state hooks
+function npc:changeState(newState)
+	if self.currentState ~= newState then
+		self:exitState(self.currentState)
+		self.currentState = newState
+		self:enterState(newState)
+	end
+end
+
+-- called when entering a state, overridden by subclasses
+function npc:enterState(state) end
+
+-- called when leaving a state, overridden by subclasses
+function npc:exitState(state) end
+
+-- moves npc to position using pathfinding or direct movement
+function npc:goTo(pos)
+	if not self.hum or not self.hrp then return end
+	if self.usePath then self:pathTo(pos) else self.hum:MoveTo(pos) end
+end
+
+-- raycasts to check if wall blocks direct path
+function npc:checkWall(targetPos)
+	if not self.hrp then return false end
+	local dir = (targetPos - self.hrp.Position)
+	local dist = dir.Magnitude
+	-- if target is too close, skip raycast since they're basically touching and npc will force through
+	if dist < 5 then return false end
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	-- ignore npc's own body so it doesn't detect itself as obstacle
+	rayParams.FilterDescendantsInstances = {self.model}
+
+	local hit = workspace:Raycast(self.hrp.Position, dir, rayParams)
+	return hit ~= nil -- true if hit something, false if clear path
+end
+
+-- uses pathfinding service to navigate around obstacles
+function npc:pathTo(targetPos)
+	if not self.hrp then return end
+	-- if no wall blocking then just move directly instead of using laggy pathfinding
+	if not self:checkWall(targetPos) then self.hum:MoveTo(targetPos) return end
+
+	-- only recalculate path if target moved significantly 
+	local needNew = self.lastTargPos == nil or (self.lastTargPos - targetPos).Magnitude > 8
+	if not needNew then return end
+
+	self.lastTargPos = targetPos
+	-- create path with npc dimensions for perferred navigation
+	local path = pathService:CreatePath({
+		AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 4
+	})
+
+	-- pcall to prevent errors from crashing the script if pathfinding fails
+	local ok = pcall(function() path:ComputeAsync(self.hrp.Position, targetPos) end)
+
+	if ok and path.Status == Enum.PathStatus.Success then
+		local waypts = path:GetWaypoints()
+		if #waypts > 1 then
+			-- follow second waypoint because first is current position
+			local next = waypts[2]
+			if next.Action == Enum.PathWaypointAction.Jump then self.hum.Jump = true end
+			self.hum:MoveTo(next.Position)
+		end
+	else
+		-- pathfinding failed then try direct movement as fallback
+		self.hum:MoveTo(targetPos)
+		self.lastTargPos = nil
+	end
+end
+
+-- picks random position within radius and moves there
+function npc:wander()
+	if not self.hrp then return end
+	local now = os.clock()
+	-- wait between wanders to prevent constant recalculation
+	if now - self.lastWanderTime < self.wanderWait then return end
+
+	self.lastWanderTime = now
+	-- generate random offset in x and z
+	local randOffset = Vector3.new(
+		math.random(-self.wanderDist, self.wanderDist), 0,
+		math.random(-self.wanderDist, self.wanderDist)
+	)
+	local wanderPos = self.hrp.Position + randOffset
+	self:goTo(wanderPos)
+end
+
+-- finds closest player within range
+function npc:findPlayers()
+	if not self.hrp then return nil, math.huge end
+	local plrs = game:GetService("Players"):GetPlayers()
+	local nearest = nil
+	local nearestDist = self.sightRange
+
+	for _, plr in ipairs(plrs) do
+		local char = plr.Character
+		if char and char:FindFirstChild("HumanoidRootPart") then
+			local dist = (char.HumanoidRootPart.Position - self.hrp.Position).Magnitude
+			if dist < nearestDist then
+				nearest = char
+				nearestDist = dist
+			end
+		end
+	end
+	return nearest, nearestDist
+end
+
+-- checks if npc moved, resets if stuck in same spot
+function npc:checkStuck()
+	if not self.hrp then return end
+	local now = os.clock()
+
+	-- only check every 5 seconds to avoid constant position comparisons
+	if now - self.lastMoveCheckTime >= self.stuckCheckInterval then
+		local currentPos = self.hrp.Position
+		local distanceMoved = (currentPos - self.lastPosition).Magnitude
+
+		-- if npc hasn't moved at least 1 stud then theyre stuck
+		if distanceMoved < self.minMovementDistance then
+			local currentCFrame = self.hrp.CFrame
+			-- calculate upright orientation while keeping current rotation direction
+			local uprightCFrame = CFrame.new(currentCFrame.Position) * CFrame.Angles(0, math.atan2(currentCFrame.LookVector.X, currentCFrame.LookVector.Z), 0)
+			-- teleport up 3 studs to get unstuck from ground
+			self.hrp.CFrame = uprightCFrame + Vector3.new(0, 3, 0)
+
+			-- reset physics velocities to prevent continued falling AND spinning
+			if self.hrp:FindFirstChild("AssemblyLinearVelocity") then
+				self.hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			end
+			if self.hrp:FindFirstChild("AssemblyAngularVelocity") then
+				self.hrp.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+			end
+
+			-- force humanoid to get up and resume normal movement
+			if self.hum then
+				self.hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+				task.wait(0.1)
+				self.hum:ChangeState(Enum.HumanoidStateType.Running)
+			end
+		end
+
+		-- update tracking for next check
+		self.lastPosition = self.hrp.Position
+		self.lastMoveCheckTime = now
+	end
+end
+
+-- main loop.. checks stuck then wanders
+function npc:tick()
+	if not self.hum or self.hum.Health <= 0 then self:cleanup() return end
+	self:checkStuck()
+	self:changeState("wandering")
+	self.targ = nil
+	self.lastTargPos = nil
+	self:wander()
+end
+
+-- destroys npc model and stops updates
+function npc:cleanup()
+	self.active = false
+	if self.model then self.model:Destroy() end
+end
+
+-- starts npc loop in separate thread
+function npc:start()
+	self.active = true
+	-- spawn new thread so multiple npcs can run simultaneously
+	task.spawn(function()
+		while self.active and self.hum and self.hum.Health > 0 do
+			self:tick() -- update npc behavior
+			task.wait(0.2) -- run 5 times per second
+		end
+		self:cleanup() -- destroy when dead or deactivated
+	end)
+end
+
+-- aggressive npc class
+local aggressive = setmetatable({}, {__index = npc})
+aggressive.__index = aggressive
+
+-- creates aggressive npc with spinning ability
+function aggressive.new(config)
+	local self = npc.new(config)
+	if not self then return nil end
+	setmetatable(self, aggressive)
+
+	-- attack configuration
+	self.atkRange = config.attackRange or 6
+	self.atkCooldown = config.attackCooldown or 0.5
+	self.lastAtk = 0
+	self.dmg = config.damage or 10
+	self.spinAngle = 0
+
+	-- spinning behavior configuration
+	self.isSpinning = false
+	self.spinStartTime = 0
+	self.spinDuration = 2 -- spin for 2 seconds
+	self.lastSpinCheck = 0
+	self.spinCheckInterval = 3 -- check every 3 seconds if should spin
+	self.spinSpeed = config.spinSpeed or 80 -- rotation speed in radians/sec
+
+	-- setup smooth physics based spinning using constraints
+	if self.hrp then
+		local spinAttachment = Instance.new("Attachment")
+		spinAttachment.Name = "SpinAttachment"
+		spinAttachment.Parent = self.hrp
+
+		-- angular velocity constraint for smooth rotation
+		local angularVelocity = Instance.new("AngularVelocity")
+		angularVelocity.Name = "SpinVelocity"
+		angularVelocity.Attachment0 = spinAttachment
+		angularVelocity.MaxTorque = 100000 -- high torque for fast spinning
+		angularVelocity.AngularVelocity = Vector3.new(0, 0, 0) -- start with no spin
+		angularVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+		angularVelocity.Parent = self.hrp
+
+		self.spinAttachment = spinAttachment
+		self.angularVelocity = angularVelocity
+	end
+
+	return self
+end
+
+-- controls spinning vs wandering vs chasing state behavior
+function aggressive:enterState(state)
+	if not self.hum then return end
+	if state == "spinning" then
+		self.hum.AutoRotate = false
+		self.hum.WalkSpeed = 0
+	elseif state == "chasing" then
+		-- sprint speed when chasing targets
+		self.hum.AutoRotate = true
+		self.hum.WalkSpeed = self.speed * 2
+	elseif state == "wandering" then
+		self.hum.AutoRotate = true
+		self.hum.WalkSpeed = self.speed
+	end
+end
+
+-- resets to normal behavior when leaving state
+function aggressive:exitState(state)
+	if self.hum then
+		self.hum.AutoRotate = true
+		self.hum.WalkSpeed = self.speed
+	end
+end
+
+-- damages target on cooldown
+function aggressive:attack(targ)
+	local now = os.clock()
+	if now - self.lastAtk < self.atkCooldown then return end
+	local targHum = targ:FindFirstChildOfClass("Humanoid")
+	if targHum then
+		targHum:TakeDamage(self.dmg)
+		self.lastAtk = now
+	end
+end
+
+-- destroys npc and spin components
+function aggressive:cleanup()
+	self.active = false
+	if self.angularVelocity then self.angularVelocity:Destroy() end
+	if self.spinAttachment then self.spinAttachment:Destroy() end
+	if self.model then self.model:Destroy() end
+end
+
+-- wanders, randomly spins, chases and attacks nearby passive and neutral npcs
+function aggressive:tick()
+	if not self.hum or self.hum.Health <= 0 then self:cleanup() return end
+	self:checkStuck()
+
+	local now = os.clock()
+
+	-- scan for nearby passive or neutral npcs within 10 studs
+	if self.hrp then
+		local nearestTarget = nil
+		local nearestDist = 10 -- detection range
+
+		-- loop through all models in workspace to find passive or neutral npcs
+		for _, part in ipairs(workspace:GetDescendants()) do
+			if part:IsA("Model") and (part.Name:match("Passive") or part.Name:match("Neutral")) and part ~= self.model then
+				local hrp = part:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local dist = (hrp.Position - self.hrp.Position).Magnitude
+					if dist < nearestDist then
+						nearestTarget = part
+						nearestDist = dist
+					end
+				end
+			end
+		end
+
+		-- if target found within 10 studs, chase and attack
+		if nearestTarget then
+			self:changeState("chasing") -- triggers 2x speed boost
+			local targetHrp = nearestTarget.HumanoidRootPart
+
+			-- sprint towards target
+			self:goTo(targetHrp.Position)
+
+			-- attack if within actual attack range (6 studs)
+			if nearestDist <= self.atkRange then
+				self:attack(nearestTarget)
+			end
+
+			return -- skip spinning/wandering while chasing
+		end
+	end
+
+	-- handle spinning state
+	if self.isSpinning then
+		-- check if spin duration finished
+		if now - self.spinStartTime >= self.spinDuration then
+			self.isSpinning = false
+			-- stop angular velocity to end spin
+			if self.angularVelocity then self.angularVelocity.AngularVelocity = Vector3.new(0, 0, 0) end
+			self:changeState("wandering")
+		else
+			return -- keep spinning skip wandering this tick
+		end
+	end
+
+	-- randomly decide to start spinning (30% chance every 3 seconds)
+	if now - self.lastSpinCheck >= self.spinCheckInterval then
+		self.lastSpinCheck = now
+		if math.random() < 0.3 then
+			self.isSpinning = true
+			self.spinStartTime = now
+			self:changeState("spinning")
+			-- activate smooth physics-based spinning
+			if self.angularVelocity then self.angularVelocity.AngularVelocity = Vector3.new(0, self.spinSpeed, 0) end
+			-- stop movement while spinning
+			if self.hum then self.hum:Move(Vector3.new(0, 0, 0)) end
+			return
+		end
+	end
+
+	-- default behavior: wander randomly
+	self:changeState("wandering")
+	self.targ = nil
+	self.lastTargPos = nil
+	self:wander()
+end
+
+-- passive npc class
+local passive = setmetatable({}, {__index = npc})
+passive.__index = passive
+
+-- creates passive npc with flee properties
+function passive.new(config)
+	local self = npc.new(config)
+	if not self then return nil end
+	setmetatable(self, passive)
+
+	self.fleeRange = config.fleeRange or 15
+	self.maxFleeDist = config.maxFleeDistance or 20
+	self.lines = config.dialogues or {"Hello!", "Nice day!", "Greetings!"}
+
+	return self
+end
+
+-- speeds up when fleeing
+function passive:enterState(state)
+	if state == "fleeing" and self.hum then
+		self.hum.WalkSpeed = self.speed * 2
+	end
+end
+
+-- resets speed when done fleeing
+function passive:exitState(state)
+	if state == "fleeing" and self.hum then
+		self.hum.WalkSpeed = self.speed
+	end
+end
+
+-- runs away from position with wall avoidance
+function passive:runAway(fromPos)
+	if not self.hrp then return end
+	-- calculate direction away from threat
+	local dir = (self.hrp.Position - fromPos).Unit
+	-- flee distance is capped at maxFleeDist or current distance + 10
+	local fleeDist = math.min(self.maxFleeDist, self.distToPlyr + 10)
+	local fleePos = self.hrp.Position + (dir * fleeDist)
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.FilterDescendantsInstances = {self.model}
+
+	-- check if wall blocks flee path
+	local hit = workspace:Raycast(self.hrp.Position, dir * fleeDist, rayParams)
+	-- if hit wall, stop 3 studs before it to avoid getting stuck
+	if hit then fleePos = hit.Position - (dir * 3) end
+
+	self:goTo(fleePos)
+end
+
+-- flees from aggressive npcs, otherwise wanders
+function passive:tick()
+	if not self.hum or self.hum.Health <= 0 then self:cleanup() return end
+	self:checkStuck()
+
+	-- scan for nearby aggressive npcs to flee from
+	if self.hrp then
+		local nearestAggressive = nil
+		local nearestDist = self.fleeRange
+
+		-- loop through all models in workspace to find aggressive npcs
+		for _, part in ipairs(workspace:GetDescendants()) do
+			if part:IsA("Model") and part.Name:match("Aggressive") and part ~= self.model then
+				local hrp = part:FindFirstChild("HumanoidRootPart")
+				if hrp then
+					local dist = (hrp.Position - self.hrp.Position).Magnitude
+					if dist < nearestDist then
+						nearestAggressive = part
+						nearestDist = dist
+						self.distToPlyr = dist -- store for flee distance calculation
+					end
+				end
+			end
+		end
+
+		-- if aggressive npc within flee range then run away at 2x speed
+		if nearestAggressive then
+			self:changeState("fleeing") -- triggers speed boost via enterState
+			self:runAway(nearestAggressive.HumanoidRootPart.Position)
+			return
+		end
+	end
+
+	-- no threats nearby so resume normal wandering
+	self:changeState("wandering")
+	self.targ = nil
+	self.lastTargPos = nil
+	self:wander()
+end
+
+-- manager class
+local manager = {}
+manager.__index = manager
+
+-- creates npc manager with empty lists
+function manager.new()
+	local self = setmetatable({}, manager)
+	self.list = {}
+	self.spawnPts = {}
+	return self
+end
+
+-- adds spawn point to list
+function manager:addSpawn(pos)
+	table.insert(self.spawnPts, pos)
+end
+
+-- spawns npc of given type at random spawn point
+function manager:spawn(npcType, cfg)
+	if #self.spawnPts == 0 then warn("no spawn points") return nil end
+	-- pick random spawn location from available spawn points
+	local spawnLoc = self.spawnPts[math.random(1, #self.spawnPts)]
+	cfg.spawnPosition = spawnLoc
+
+	-- create npc using the class constructor (npc, aggressive, or passive)
+	local bot = npcType.new(cfg)
+	if bot then
+		-- add to tracking list and start its update loop
+		table.insert(self.list, bot)
+		bot:start()
+	end
+	return bot
+end
+
+-- removes specific npc from list and destroys it
+function manager:remove(bot)
+	for i, b in ipairs(self.list) do
+		if b == bot then
+			table.remove(self.list, i)
+			bot:cleanup()
+			break
+		end
+	end
+end
+
+-- destroys all npcs and clears list
+function manager:clearAll()
+	for _, bot in ipairs(self.list) do bot:cleanup() end
+	self.list = {}
+end
+
+-- returns total npc count
+function manager:count()
+	return #self.list
+end
+
+return {
+	npc = npc,
+	aggressive = aggressive,
+	passive = passive,
+	manager = manager
+}
